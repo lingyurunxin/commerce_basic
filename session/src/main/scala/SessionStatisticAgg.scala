@@ -1,4 +1,4 @@
-import java.util.{Date, UUID}
+import java.util.{Date, Random, UUID}
 
 import commons.conf.ConfigurationManager
 import commons.constant.Constants
@@ -10,57 +10,164 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{SaveMode, SparkSession}
 
 import scala.collection.mutable
+import scala.collection.mutable.{ArrayBuffer, ListBuffer}
 
-object SessionStat {
+object SessionStatisticAgg {
 
   def main(args: Array[String]): Unit = {
 
-    // 获取筛选条件
+    // 获取查询的限制条件
     val jsonStr = ConfigurationManager.config.getString(Constants.TASK_PARAMS)
-    // 获取筛选条件对应的JsonObject
     val taskParam = JSONObject.fromObject(jsonStr)
 
-    // 创建全局唯一的主键
+    // 获取全局独一无二的主键
     val taskUUID = UUID.randomUUID().toString
 
     // 创建sparkConf
     val sparkConf = new SparkConf().setAppName("session").setMaster("local[*]")
 
-    // 创建sparkSession（包含sparkContext）
+    // 创建sparkSession
     val sparkSession = SparkSession.builder().config(sparkConf).enableHiveSupport().getOrCreate()
 
-    // 获取原始的动作表数据
-    // actionRDD: RDD[UserVisitAction]
-    val actionRDD = getOriActionRDD(sparkSession, taskParam)
+    // actionRDD: rdd[UserVisitAction]
+    val actionRDD = getActionRDD(sparkSession, taskParam)
 
-    // sessionId2ActionRDD: RDD[(sessionId, UserVisitAction)]
-    val sessionId2ActionRDD = actionRDD.map(item => (item.session_id, item))
+    // sessionId2ActionRDD: rdd[(sid, UserVisitAction)]
+    val sessionId2ActionRDD = actionRDD.map{
+      item => (item.session_id, item)
+    }
 
-    // session2GroupActionRDD: RDD[(sessionId, iterable_UserVisitAction)]
-    val session2GroupActionRDD = sessionId2ActionRDD.groupByKey()
+    // sessionId2GroupRDD: rdd[(sid, iterable(UserVisitAction))]
+    val sessionId2GroupRDD = sessionId2ActionRDD.groupByKey()
 
-    session2GroupActionRDD.cache()
+    // sparkSession.sparkContext.setCheckpointDir()
+    sessionId2GroupRDD.cache()
+    // sessionId2GroupRDD.checkpoint()
 
-    // sessionId2FullInfoRDD: RDD[(sessionId, fullInfo)]
-    val sessionId2FullInfoRDD = getSessionFullInfo(sparkSession, session2GroupActionRDD)
+    // 获取聚合数据里面的聚合信息
+    val sessionId2FullInfoRDD = getFullInfoData(sparkSession, sessionId2GroupRDD)
 
-    val sessionAccumulator = new SessionAccumulator
+    // 创建自定义累加器对象
+    val sessionStatAccumulator = new SessionStatAccumulator
+    // 注册自定义累加器
+    sparkSession.sparkContext.register(sessionStatAccumulator, "sessionAccumulator")
 
-    sparkSession.sparkContext.register(sessionAccumulator)
+    // 过滤用户数据
+    val sessionId2FilterRDD = getFilteredData(taskParam, sessionStatAccumulator, sessionId2FullInfoRDD)
 
-    // sessionId2FilterRDD: RDD[(sessionId, fullInfo)] 是所有符合过滤条件的数据组成的RDD
-    // getSessionFilteredRDD: 实现根据限制条件对session数据进行过滤，并完成累加器的更新
-    val sessionId2FilterRDD = getSessionFilteredRDD(taskParam, sessionId2FullInfoRDD, sessionAccumulator)
+    sessionId2FilterRDD.count()
 
-    sessionId2FilterRDD.foreach(println(_))
+    // 获取最终的统计结果
+    getFinalData(sparkSession, taskUUID, sessionStatAccumulator.value)
 
-    getSessionRatio(sparkSession, taskUUID, sessionAccumulator.value)
+    // 需求二：session随机抽取
+    // sessionId2FilterRDD： RDD[(sid, fullInfo)] 一个session对应一条数据，也就是一个fullInfo
+    sessionRandomExtract(sparkSession, taskUUID, sessionId2FilterRDD)
+}
+  def generateRandomIndexList(extractPerDay:Long,
+                              daySessionCount:Long,
+                              hourCountMap:mutable.HashMap[String, Long],
+                              hourListMap:mutable.HashMap[String, ListBuffer[Int]]): Unit ={
+    for((hour, count) <- hourCountMap){
+      // 获取一个小时要抽取多少条数据
+      var hourExrCount = ((count / daySessionCount.toDouble) * extractPerDay).toInt
+      // 避免一个小时要抽取的数量超过这个小时的总数
+      if(hourExrCount > count){
+        hourExrCount = count.toInt
+      }
+
+      val random = new Random()
+
+      hourListMap.get(hour) match{
+        case None => hourListMap(hour) = new ListBuffer[Int]
+          for(i <- 0 until hourExrCount){
+            var index = random.nextInt(count.toInt)
+            while(hourListMap(hour).contains(index)){
+              index = random.nextInt(count.toInt)
+            }
+            hourListMap(hour).append(index)
+          }
+        case Some(list) =>
+          for(i <- 0 until hourExrCount){
+            var index = random.nextInt(count.toInt)
+            while(hourListMap(hour).contains(index)){
+              index = random.nextInt(count.toInt)
+            }
+            hourListMap(hour).append(index)
+          }
+      }
+    }
   }
 
-  def getSessionRatio(sparkSession: SparkSession, taskUUID: String, value: mutable.HashMap[String, Int]): Unit = {
+  def sessionRandomExtract(sparkSession: SparkSession,
+                           taskUUID: String,
+                           sessionId2FilterRDD: RDD[(String, String)]): Unit = {
+    // dateHour2FullInfoRDD: RDD[(dateHour, fullInfo)]
+    val dateHour2FullInfoRDD = sessionId2FilterRDD.map{
+      case (sid, fullInfo) =>
+        val startTime = StringUtils.getFieldFromConcatString(fullInfo, "\\|", Constants.FIELD_START_TIME)
+        // dateHour: yyyy-MM-dd_HH
+        val dateHour = DateUtils.getDateHour(startTime)
+        (dateHour, fullInfo)
+    }
 
+    // hourCountMap: Map[(dateHour, count)]
+    val hourCountMap = dateHour2FullInfoRDD.countByKey()
+
+    // dateHourCountMap: Map[(date, Map[(hour, count)])]
+    val dateHourCountMap = new mutable.HashMap[String, mutable.HashMap[String, Long]]()
+
+    for((dateHour, count) <- hourCountMap){
+      val date = dateHour.split("_")(0)
+      val hour = dateHour.split("_")(1)
+
+      dateHourCountMap.get(date) match{
+        case None => dateHourCountMap(date) = new mutable.HashMap[String, Long]()
+          dateHourCountMap(date) += (hour->count)
+        case Some(map) => dateHourCountMap(date) += (hour->count)
+      }
+    }
+
+    // 解决问题一： 一共有多少天： dateHourCountMap.size
+    //              一天抽取多少条：100 / dateHourCountMap.size
+    val extractPerDay = 100 / dateHourCountMap.size
+
+    // 解决问题二： 一天有多少session：dateHourCountMap(date).values.sum
+    // 解决问题三： 一个小时有多少session：dateHourCountMap(date)(hour)
+
+    val dateHourExtractIndexListMap = new mutable.HashMap[String, mutable.HashMap[String, ListBuffer[Int]]]()
+
+    // dateHourCountMap: Map[(date, Map[(hour, count)])]
+    for((date, hourCountMap) <- dateHourCountMap){
+      val dateSessionCount = hourCountMap.values.sum
+
+      dateHourExtractIndexListMap.get(date) match{
+        case None => dateHourExtractIndexListMap(date) = new mutable.HashMap[String, ListBuffer[Int]]()
+          generateRandomIndexList(extractPerDay, dateSessionCount, hourCountMap,  dateHourExtractIndexListMap(date))
+        case Some(map) =>
+          generateRandomIndexList(extractPerDay, dateSessionCount, hourCountMap,  dateHourExtractIndexListMap(date))
+      }
+
+      // 到目前为止，我们获得了每个小时要抽取的session的index
+
+      // 广播大变量，提升任务性能
+      val dateHourExtractIndexListMapBd = sparkSession.sparkContext.broadcast(dateHourExtractIndexListMap)
+
+
+
+
+
+    }
+
+  }
+
+  def getFinalData(sparkSession: SparkSession,
+                   taskUUID: String,
+                   value: mutable.HashMap[String, Int]): Unit = {
+    // 获取所有符合过滤条件的session个数
     val session_count = value.getOrElse(Constants.SESSION_COUNT, 1).toDouble
 
+    // 不同范围访问时长的session个数
     val visit_length_1s_3s = value.getOrElse(Constants.TIME_PERIOD_1s_3s, 0)
     val visit_length_4s_6s = value.getOrElse(Constants.TIME_PERIOD_4s_6s, 0)
     val visit_length_7s_9s = value.getOrElse(Constants.TIME_PERIOD_7s_9s, 0)
@@ -71,6 +178,7 @@ object SessionStat {
     val visit_length_10m_30m = value.getOrElse(Constants.TIME_PERIOD_10m_30m, 0)
     val visit_length_30m = value.getOrElse(Constants.TIME_PERIOD_30m, 0)
 
+    // 不同访问步长的session个数
     val step_length_1_3 = value.getOrElse(Constants.STEP_PERIOD_1_3, 0)
     val step_length_4_6 = value.getOrElse(Constants.STEP_PERIOD_4_6, 0)
     val step_length_7_9 = value.getOrElse(Constants.STEP_PERIOD_7_9, 0)
@@ -101,25 +209,25 @@ object SessionStat {
       step_length_1_3_ratio, step_length_4_6_ratio, step_length_7_9_ratio,
       step_length_10_30_ratio, step_length_30_60_ratio, step_length_60_ratio)
 
-    val sessionRatioRDD = sparkSession.sparkContext.makeRDD(Array(stat))
+    val statRDD = sparkSession.sparkContext.makeRDD(Array(stat))
 
     import sparkSession.implicits._
-    sessionRatioRDD.toDF().write
+    statRDD.toDF().write
       .format("jdbc")
       .option("url", ConfigurationManager.config.getString(Constants.JDBC_URL))
       .option("user", ConfigurationManager.config.getString(Constants.JDBC_USER))
       .option("password", ConfigurationManager.config.getString(Constants.JDBC_PASSWORD))
-      .option("dbtable", "session_stat_ratio_0416")
+      .option("dbtable", "session_ration_0308")
       .mode(SaveMode.Append)
       .save()
   }
 
-  def calculateVisitLength(visitLength: Long, sessionStatisticAccumulator: SessionAccumulator) = {
-    if(visitLength >= 1 && visitLength <= 3){
+  def calculateVisitLength(visitLength:Long, sessionStatisticAccumulator: SessionStatAccumulator): Unit ={
+    if(visitLength >=1 && visitLength<=3) {
       sessionStatisticAccumulator.add(Constants.TIME_PERIOD_1s_3s)
-    }else if(visitLength >=4 && visitLength  <= 6){
+    } else if (visitLength >= 4 && visitLength <= 6) {
       sessionStatisticAccumulator.add(Constants.TIME_PERIOD_4s_6s)
-    }else if (visitLength >= 7 && visitLength <= 9) {
+    } else if (visitLength >= 7 && visitLength <= 9) {
       sessionStatisticAccumulator.add(Constants.TIME_PERIOD_7s_9s)
     } else if (visitLength >= 10 && visitLength <= 30) {
       sessionStatisticAccumulator.add(Constants.TIME_PERIOD_10s_30s)
@@ -134,9 +242,10 @@ object SessionStat {
     } else if (visitLength > 1800) {
       sessionStatisticAccumulator.add(Constants.TIME_PERIOD_30m)
     }
+
   }
 
-  def calculateStepLength(stepLength: Long, sessionStatisticAccumulator: SessionAccumulator) = {
+  def calculateStepLength(stepLength:Long, sessionStatisticAccumulator: SessionStatAccumulator): Unit ={
     if(stepLength >=1 && stepLength <=3){
       sessionStatisticAccumulator.add(Constants.STEP_PERIOD_1_3)
     }else if (stepLength >= 4 && stepLength <= 6) {
@@ -152,9 +261,9 @@ object SessionStat {
     }
   }
 
-  def getSessionFilteredRDD(taskParam: JSONObject,
-                            sessionId2FullInfoRDD: RDD[(String, String)],
-                            sessionAccumulator: SessionAccumulator) = {
+  def getFilteredData(taskParam: JSONObject,
+                      sessionStatAccumulator: SessionStatAccumulator,
+                      sessionId2FullInfoRDD: RDD[(String, String)])= {
 
     val startAge = ParamUtils.getParam(taskParam, Constants.PARAM_START_AGE)
     val endAge = ParamUtils.getParam(taskParam, Constants.PARAM_END_AGE)
@@ -175,51 +284,59 @@ object SessionStat {
     if(filterInfo.endsWith("\\|"))
       filterInfo = filterInfo.substring(0, filterInfo.length - 1)
 
-    sessionId2FullInfoRDD.filter{
+    val sessionId2FilterRDD = sessionId2FullInfoRDD.filter{
       case (sessionId, fullInfo) =>
         var success = true
 
-        if(!ValidUtils.between(fullInfo, Constants.FIELD_AGE, filterInfo, Constants.PARAM_START_AGE, Constants.PARAM_END_AGE)){
+        if(!ValidUtils.between(fullInfo, Constants.FIELD_AGE, filterInfo, Constants.PARAM_START_AGE, Constants.PARAM_END_AGE))
           success = false
-        }else if(!ValidUtils.in(fullInfo, Constants.FIELD_PROFESSIONAL, filterInfo, Constants.PARAM_PROFESSIONALS)){
+
+        if(!ValidUtils.in(fullInfo, Constants.FIELD_PROFESSIONAL, filterInfo, Constants.PARAM_PROFESSIONALS))
           success = false
-        }else if(!ValidUtils.in(fullInfo, Constants.FIELD_CITY, filterInfo, Constants.PARAM_CITIES)){
+
+        if (!ValidUtils.in(fullInfo, Constants.FIELD_CITY, filterInfo, Constants.PARAM_CITIES))
           success = false
-        }else if(!ValidUtils.equal(fullInfo, Constants.FIELD_SEX, filterInfo, Constants.PARAM_SEX)){
+
+        if (!ValidUtils.equal(fullInfo, Constants.FIELD_SEX, filterInfo, Constants.PARAM_SEX))
           success = false
-        }else if(!ValidUtils.in(fullInfo, Constants.FIELD_SEARCH_KEYWORDS, filterInfo, Constants.PARAM_KEYWORDS)){
+
+        if (!ValidUtils.in(fullInfo, Constants.FIELD_SEARCH_KEYWORDS, filterInfo, Constants.PARAM_KEYWORDS))
           success = false
-        }else if(!ValidUtils.in(fullInfo, Constants.FIELD_CLICK_CATEGORY_IDS, filterInfo, Constants.PARAM_CATEGORY_IDS)){
+
+        if (!ValidUtils.in(fullInfo, Constants.FIELD_CATEGORY_ID, filterInfo, Constants.PARAM_CATEGORY_IDS))
           success = false
-        }
 
         if(success){
-          sessionAccumulator.add(Constants.SESSION_COUNT)
+
+          // 只要进入此处，就代表此session数据符合过滤条件，进行总数的计数
+          sessionStatAccumulator.add(Constants.SESSION_COUNT)
 
           val visitLength = StringUtils.getFieldFromConcatString(fullInfo, "\\|", Constants.FIELD_VISIT_LENGTH).toLong
           val stepLength = StringUtils.getFieldFromConcatString(fullInfo, "\\|", Constants.FIELD_STEP_LENGTH).toLong
 
-          calculateVisitLength(visitLength, sessionAccumulator)
-          calculateStepLength(stepLength, sessionAccumulator)
+          calculateVisitLength(visitLength, sessionStatAccumulator)
+          calculateStepLength(stepLength, sessionStatAccumulator)
         }
         success
     }
+
+    sessionId2FilterRDD
   }
 
-  def getSessionFullInfo(sparkSession: SparkSession,
-                         session2GroupActionRDD: RDD[(String, Iterable[UserVisitAction])]) = {
-    // userId2AggrInfoRDD: RDD[(userId, aggrInfo)]
-    val userId2AggrInfoRDD = session2GroupActionRDD.map{
-      case (sessionId, iterableAction) =>
-        var userId = -1L
 
+  def getFullInfoData(sparkSession: SparkSession,
+                      sessionId2GroupRDD: RDD[(String, Iterable[UserVisitAction])]) = {
+    val userId2AggrInfoRDD = sessionId2GroupRDD.map{
+      case (sid, iterableAction) =>
         var startTime:Date = null
         var endTime:Date = null
 
-        var stepLength = 0
+        var userId = -1L
 
         val searchKeywords = new StringBuffer("")
         val clickCategories = new StringBuffer("")
+
+        var stepLength = 0
 
         for(action <- iterableAction){
           if(userId == -1L){
@@ -227,33 +344,33 @@ object SessionStat {
           }
 
           val actionTime = DateUtils.parseTime(action.action_time)
-          if(startTime == null || startTime.after(actionTime)){
+
+          if(startTime == null || startTime.after(actionTime))
             startTime = actionTime
-          }
-          if(endTime == null || endTime.before(actionTime)){
+
+          if(endTime == null || endTime.before(actionTime))
             endTime = actionTime
-          }
 
           val searchKeyword = action.search_keyword
-          if(StringUtils.isNotEmpty(searchKeyword) && !searchKeywords.toString.contains(searchKeyword)){
-            searchKeywords.append(searchKeyword + ",")
-          }
+          val clickCategory = action.click_category_id
 
-          val clickCategoryId = action.click_category_id
-          if(clickCategoryId != -1 && !clickCategories.toString.contains(clickCategoryId)){
-            clickCategories.append(clickCategoryId + ",")
-          }
+          if(StringUtils.isNotEmpty(searchKeyword) &&
+            !searchKeywords.toString.contains(searchKeyword))
+            searchKeywords.append(searchKeyword + ",")
+
+          if(clickCategory != -1L &&
+            !clickCategories.toString.contains(clickCategory))
+            clickCategories.append(clickCategory + ",")
 
           stepLength += 1
         }
 
-        // searchKeywords.toString.substring(0, searchKeywords.toString.length)
         val searchKw = StringUtils.trimComma(searchKeywords.toString)
         val clickCg = StringUtils.trimComma(clickCategories.toString)
 
         val visitLength = (endTime.getTime - startTime.getTime) / 1000
 
-        val aggrInfo = Constants.FIELD_SESSION_ID + "=" + sessionId + "|" +
+        val aggrInfo = Constants.FIELD_SESSION_ID + "=" + sid + "|" +
           Constants.FIELD_SEARCH_KEYWORDS + "=" + searchKw + "|" +
           Constants.FIELD_CLICK_CATEGORY_IDS + "=" + clickCg + "|" +
           Constants.FIELD_VISIT_LENGTH + "=" + visitLength + "|" +
@@ -266,18 +383,20 @@ object SessionStat {
     val sql = "select * from user_info"
 
     import sparkSession.implicits._
-    // userId2InfoRDD:RDD[(userId, UserInfo)]
-    val userId2InfoRDD = sparkSession.sql(sql).as[UserInfo].rdd.map(item => (item.user_id, item))
+    // sparkSession.sql(sql): DateFrame DateSet[Row]
+    // sparkSession.sql(sql).as[UserInfo]: DateSet[UserInfo]
+    //  sparkSession.sql(sql).as[UserInfo].rdd: RDD[UserInfo]
+    // sparkSession.sql(sql).as[UserInfo].rdd.map(item => (item.user_id, item)): RDD[(userId, UserInfo)]
+    val userInfoRDD = sparkSession.sql(sql).as[UserInfo].rdd.map(item => (item.user_id, item))
 
-    val sessionId2FullInfoRDD = userId2AggrInfoRDD.join(userId2InfoRDD).map{
+    userId2AggrInfoRDD.join(userInfoRDD).map{
       case (userId, (aggrInfo, userInfo)) =>
         val age = userInfo.age
         val professional = userInfo.professional
         val sex = userInfo.sex
         val city = userInfo.city
 
-        val fullInfo = aggrInfo + "|" +
-          Constants.FIELD_AGE + "=" + age + "|" +
+        val fullInfo = aggrInfo + "|" + Constants.FIELD_AGE + "=" + age + "|" +
           Constants.FIELD_PROFESSIONAL + "=" + professional + "|" +
           Constants.FIELD_SEX + "=" + sex + "|" +
           Constants.FIELD_CITY + "=" + city
@@ -286,20 +405,22 @@ object SessionStat {
 
         (sessionId, fullInfo)
     }
-
-    sessionId2FullInfoRDD
   }
 
 
-  def getOriActionRDD(sparkSession: SparkSession, taskParam: JSONObject) = {
+  def getActionRDD(sparkSession: SparkSession, taskParam: JSONObject) = {
+
     val startDate = ParamUtils.getParam(taskParam, Constants.PARAM_START_DATE)
     val endDate = ParamUtils.getParam(taskParam, Constants.PARAM_END_DATE)
 
-    val sql = "select * from user_visit_action where date>='" + startDate + "' and date<='" + endDate + "'"
+    val sql = "select * from user_visit_action where date>='" + startDate + "' and date<='" +
+      endDate + "'"
 
     import sparkSession.implicits._
+    // sparkSession.sql(sql) : DataFrame   DateSet[Row]
+    // sparkSession.sql(sql).as[UserVisitAction]: DateSet[UserVisitAction]
+    // sparkSession.sql(sql).as[UserVisitAction].rdd: rdd[UserVisitAction]
     sparkSession.sql(sql).as[UserVisitAction].rdd
   }
-
 
 }

@@ -14,23 +14,23 @@ import scala.util.Random
 
 
 /**
-  * 模拟的数据
-  * date：是当前日期
-  * age: 0 - 59
-  * professionals: professional[0 - 59]
-  * cities: 0 - 9
-  * sex: 0 - 1
-  * keywords: ("火锅", "蛋糕", "重庆辣子鸡", "重庆小面", "呷哺呷哺", "新辣道鱼火锅", "国贸大厦", "太古商场", "日本料理", "温泉")
-  * categoryIds: 0 - 99
-  * ProductId: 0 - 99
-  */
+ * 模拟的数据
+ * date：是当前日期
+ * age: 0 - 59
+ * professionals: professional[0 - 59]
+ * cities: 0 - 9
+ * sex: 0 - 1
+ * keywords: ("火锅", "蛋糕", "重庆辣子鸡", "重庆小面", "呷哺呷哺", "新辣道鱼火锅", "国贸大厦", "太古商场", "日本料理", "温泉")
+ * categoryIds: 0 - 99
+ * ProductId: 0 - 99
+ */
 object MockDataGenerate {
 
   /**
-    * 模拟用户行为信息
-    *
-    * @return
-    */
+   * 模拟用户行为信息
+   *
+   * @return
+   */
   private def mockUserVisitActionData(): Array[UserVisitAction] = {
 
     val searchKeywords = Array("华为手机", "联想笔记本", "小龙虾", "卫生纸", "吸尘器", "Lamer", "机器学习", "苹果", "洗面奶", "保温杯")
@@ -89,10 +89,10 @@ object MockDataGenerate {
   }
 
   /**
-    * 模拟用户信息表
-    *
-    * @return
-    */
+   * 模拟用户信息表
+   *
+   * @return
+   */
   private def mockUserInfo(): Array[UserInfo] = {
 
     val rows = ArrayBuffer[UserInfo]()
@@ -115,10 +115,10 @@ object MockDataGenerate {
   }
 
   /**
-    * 模拟产品数据表
-    *
-    * @return
-    */
+   * 模拟产品数据表
+   *
+   * @return
+   */
   private def mockProductInfo(): Array[ProductInfo] = {
 
     val rows = ArrayBuffer[ProductInfo]()
@@ -138,12 +138,12 @@ object MockDataGenerate {
   }
 
   /**
-    * 将DataFrame插入到Hive表中
-    *
-    * @param spark     SparkSQL客户端
-    * @param tableName 表名
-    * @param dataDF    DataFrame
-    */
+   * 将DataFrame插入到Hive表中
+   *
+   * @param spark     SparkSQL客户端
+   * @param tableName 表名
+   * @param dataDF    DataFrame
+   */
   private def insertHive(spark: SparkSession, tableName: String, dataDF: DataFrame): Unit = {
     spark.sql("DROP TABLE IF EXISTS " + tableName)
     dataDF.write.saveAsTable(tableName)
@@ -154,10 +154,10 @@ object MockDataGenerate {
   val PRODUCT_INFO_TABLE = "product_info"
 
   /**
-    * 主入口方法
-    *
-    * @param args 启动参数
-    */
+   * 主入口方法
+   *
+   * @param args 启动参数
+   */
   def main(args: Array[String]): Unit = {
 
     // 创建Spark配置
@@ -166,7 +166,6 @@ object MockDataGenerate {
     // 创建Spark SQL 客户端
     val spark = SparkSession.builder().config(sparkConf).enableHiveSupport().getOrCreate()
 
-    // 模拟数据
     val userVisitActionData = this.mockUserVisitActionData()
     val userInfoData = this.mockUserInfo()
     val productInfoData = this.mockProductInfo()
