@@ -2,7 +2,7 @@ import org.apache.spark.util.AccumulatorV2
 
 import scala.collection.mutable
 
-class SessionAccumulator extends AccumulatorV2[String, mutable.HashMap[String, Int]] {
+class SessionStatAccumulator extends AccumulatorV2[String, mutable.HashMap[String, Int]] {
 
   val countMap = new mutable.HashMap[String, Int]()
 
@@ -11,7 +11,7 @@ class SessionAccumulator extends AccumulatorV2[String, mutable.HashMap[String, I
   }
 
   override def copy(): AccumulatorV2[String, mutable.HashMap[String, Int]] = {
-    val acc = new SessionAccumulator
+    val acc = new SessionStatAccumulator
     acc.countMap ++= this.countMap
     acc
   }
@@ -32,13 +32,13 @@ class SessionAccumulator extends AccumulatorV2[String, mutable.HashMap[String, I
       // (0 /: (1 to 100)){case (int1, int2) => int1 + int2}
       // (1 /: 100).foldLeft(0)
       // (this.countMap /: acc.countMap)
-      case acc: SessionAccumulator => acc.countMap.foldLeft(this.countMap) {
+      case acc: SessionStatAccumulator => acc.countMap.foldLeft(this.countMap) {
         case (map, (k, v)) => map += (k -> (map.getOrElse(k, 0) + v))
       }
     }
   }
 
-  override def value: mutable.HashMap[String, Int] = {
+  override def value(): mutable.HashMap[String, Int] = {
     this.countMap
   }
 }

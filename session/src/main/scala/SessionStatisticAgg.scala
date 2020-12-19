@@ -58,7 +58,7 @@ object SessionStatisticAgg {
     sessionId2FilterRDD.count()
 
     // 获取最终的统计结果
-    getFinalData(sparkSession, taskUUID, sessionStatAccumulator.value)
+    getFinalData(sparkSession, taskUUID, sessionStatAccumulator.value())
 
     // 需求二：session随机抽取
     // sessionId2FilterRDD： RDD[(sid, fullInfo)] 一个session对应一条数据，也就是一个fullInfo
